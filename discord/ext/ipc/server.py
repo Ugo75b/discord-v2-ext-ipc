@@ -1,7 +1,12 @@
 import logging
+from typing import List, Optional
 
 import aiohttp.web
-from discord.ext.ipc.errors import *
+from discord.ext.commands import Cog
+from discord.abc import Snowflake
+from discord.utils import MISSING
+
+from .errors import *
 
 log = logging.getLogger(__name__)
 
@@ -19,10 +24,8 @@ def route(name=None):
     """
 
     def decorator(func):
-        if not name:
-            Server.ROUTES[func.__name__] = func
-        else:
-            Server.ROUTES[name] = func
+        route_name = name or func.__name__
+        setattr(func, "__ipc_route__", route_name)
 
         return func
 
@@ -70,8 +73,6 @@ class Server:
         The port to run the multicasting server on. Defaults to 20000
     """
 
-    ROUTES = {}
-
     def __init__(
         self,
         bot,
@@ -95,7 +96,52 @@ class Server:
         self.do_multicast = do_multicast
         self.multicast_port = multicast_port
 
+        self._add_cog = bot.add_cog
+        bot.add_cog = self.add_cog
+
         self.endpoints = {}
+        self.sorted_endpoints = {}
+
+    def update_endpoints(self):
+        """Ensures endpoints is up to date"""
+
+        self.endpoints = {}
+        for routes in self.sorted_endpoints.values():
+            self.endpoints = {**self.endpoints, **routes}
+
+    async def add_cog(
+            self,
+            cog: Cog,
+            /,
+            *,
+            override: bool = False,
+            guild: Optional[Snowflake] = MISSING,
+            guilds: List[Snowflake] = MISSING,
+    ) -> None:
+        """
+        Hooks into add_cog and allows for easy route finding within classes
+        """
+        await self._add_cog(cog, override=override, guild=guild, guilds=guilds)
+
+        method_list = [
+            getattr(cog, func)
+            for func in dir(cog)
+            if callable(getattr(cog, func)) and getattr(getattr(cog, func), "__ipc_route__", None)
+        ]
+
+        # Reset endpoints for this class
+        cog_name = cog.__class__.__name__
+        self.sorted_endpoints[cog_name] = {}
+
+        for method in method_list:
+            method_name = getattr(method, "__ipc_route__")
+            if cog_name not in self.sorted_endpoints:
+                self.sorted_endpoints[cog_name] = {}
+            self.sorted_endpoints[cog_name][method_name] = method
+
+        self.update_endpoints()
+
+        log.debug("Updated routes for Cog %s", cog_name)
 
     def route(self, name=None):
         """Used to register a coroutine as an endpoint when you have
@@ -108,20 +154,20 @@ class Server:
         """
 
         def decorator(func):
-            if not name:
-                self.endpoints[func.__name__] = func
-            else:
-                self.endpoints[name] = func
+            route_name = name or func.__name__
+            setattr(func, "__ipc_route__", route_name)
+
+            if "__main__" not in self.sorted_endpoints:
+                self.sorted_endpoints["__main__"] = {}
+
+            self.sorted_endpoints["__main__"][route_name] = func
+
+            self.update_endpoints()
+            log.debug("Added IPC route %s", route_name)
 
             return func
 
         return decorator
-
-    def update_endpoints(self):
-        """Called internally to update the server's endpoints for cog routes."""
-        self.endpoints = {**self.endpoints, **self.ROUTES}
-
-        self.ROUTES = {}
 
     async def handle_accept(self, request):
         """Handles websocket requests from the client process.
@@ -131,7 +177,6 @@ class Server:
         request: :class:`~aiohttp.web.Request`
             The request made by the client, parsed by aiohttp.
         """
-        self.update_endpoints()
 
         log.info("Initiating IPC Server.")
 
@@ -148,7 +193,9 @@ class Server:
             headers = request.get("headers")
 
             if not headers or headers.get("Authorization") != self.secret_key:
-                log.info("Received unauthorized request (Invalid or no token provided).")
+                log.info(
+                    "Received unauthorized request (Invalid or no token provided)."
+                )
                 response = {"error": "Invalid or no token provided.", "code": 403}
             else:
                 if not endpoint or endpoint not in self.endpoints:
@@ -156,21 +203,9 @@ class Server:
                     response = {"error": "Invalid or no endpoint given.", "code": 400}
                 else:
                     server_response = IpcServerResponse(request)
-                    try:
-                        attempted_cls = self.bot.cogs.get(
-                            self.endpoints[endpoint].__qualname__.split(".")[0]
-                        )
-
-                        if attempted_cls:
-                            arguments = (attempted_cls, server_response)
-                        else:
-                            arguments = (server_response,)
-                    except AttributeError:
-                        # Support base Client
-                        arguments = (server_response,)
 
                     try:
-                        ret = await self.endpoints[endpoint](*arguments)
+                        ret = await self.endpoints[endpoint](server_response)
                         response = ret
                     except Exception as error:
                         log.error(
@@ -248,9 +283,10 @@ class Server:
         site = aiohttp.web.TCPSite(runner, self.host, port)
         await site.start()
 
-    def start(self):
+    async def start(self):
         """Starts the IPC server."""
-        self.bot.dispatch("ipc_ready")
+        if self.bot.is_ready():
+            self.bot.dispatch("ipc_ready")
 
         self._server = aiohttp.web.Application()
         self._server.router.add_route("GET", "/", self.handle_accept)
@@ -259,6 +295,6 @@ class Server:
             self._multicast_server = aiohttp.web.Application()
             self._multicast_server.router.add_route("GET", "/", self.handle_multicast)
 
-            self.loop.run_until_complete(self.__start(self._multicast_server, self.multicast_port))
+            await self.__start(self._multicast_server, self.multicast_port)
 
-        self.loop.run_until_complete(self.__start(self._server, self.port))
+        await self.__start(self._server, self.port)
